@@ -1,0 +1,84 @@
+name: Publish signed obra update feeds
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published release tag, e.g. v0.0.47
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: obra-release-update-feed
+  cancel-in-progress: false
+jobs:
+  feed:
+    runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      RELEASE_REPO: ${{ github.repository }}
+      SIGNING_KEY: ${{ secrets.OBRA_SPARKLE_PRIVATE_KEY }}
+    steps:
+      - name: Fetch and verify the pinned Sparkle tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --max-time 180 https://github.com/sparkle-project/Sparkle/releases/download/2.9.6/Sparkle-2.9.6.tar.xz -o "$RUNNER_TEMP/sparkle.tar.xz"
+          echo "52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192  $RUNNER_TEMP/sparkle.tar.xz" | shasum -a 256 -c -
+          mkdir "$RUNNER_TEMP/sparkle"
+          tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+      - name: Sign installer archives and attach update feeds
+        shell: python
+        run: |
+          import html, json, os, pathlib, re, subprocess, tempfile, xml.etree.ElementTree as ET
+          repo, tag = os.environ['RELEASE_REPO'], os.environ['RELEASE_TAG']
+          if repo != 'holuc2702/obra' or not re.fullmatch(r'v\d+\.\d+\.\d+', tag):
+              raise SystemExit('Unexpected repository or release version')
+          key = os.environ.pop('SIGNING_KEY', '').strip()
+          if not key:
+              raise SystemExit('Missing OBRA_SPARKLE_PRIVATE_KEY secret')
+          def gh(*args):
+              return subprocess.check_output(['gh', *args], text=True)
+          release = json.loads(gh('api', f'repos/{repo}/releases/tags/{tag}'))
+          if release['draft'] or release['prerelease']:
+              raise SystemExit('Only stable, published releases become automatic updates')
+          if not release.get('body', '').strip():
+              raise SystemExit('Write release notes before publishing the update')
+          assets = {}
+          for asset in release['assets']:
+              match = re.fullmatch(r'obra-(\d+\.\d+\.\d+)-macos-(aarch64|x86_64|universal)\.(dmg|zip)', asset['name'])
+              if match and match[1] == tag[1:]:
+                  if asset['size'] <= 0 or asset['size'] > 3 * 1024**3:
+                      raise SystemExit('Unexpected installer size')
+                  arch = match[2]
+                  # Prefer the DMG when the release offers both archive formats.
+                  if arch not in assets or match[3] == 'dmg':
+                      assets[arch] = asset
+          if not assets:
+              raise SystemExit('No correctly named obra DMG/ZIP installer attached')
+          ns = '{http://www.andymatuschak.org/xml-namespaces/sparkle}'
+          with tempfile.TemporaryDirectory(prefix='obra-feeds-') as folder:
+              root = pathlib.Path(folder)
+              key_path = root / 'signing-key'
+              key_path.touch(mode=0o600)
+              key_path.write_text(key)
+              for arch, asset in assets.items():
+                  stage = root / arch
+                  stage.mkdir()
+                  gh('release', 'download', tag, '--repo', repo, '--pattern', asset['name'], '--dir', str(stage))
+                  archive = stage / asset['name']
+                  archive.with_suffix('.html').write_text('<pre style="white-space: pre-wrap">' + html.escape(release['body']) + '</pre>')
+                  feed = stage / f'appcast-{arch}.xml'
+                  subprocess.run([os.environ['RUNNER_TEMP'] + '/sparkle/bin/generate_appcast',
+                      '--ed-key-file', str(key_path), '--embed-release-notes', '--download-url-prefix',
+                      f'https://github.com/{repo}/releases/download/{tag}/',
+                      '--link', f'https://github.com/{repo}', '-o', str(feed), str(stage)], check=True)
+                  item = ET.parse(feed).getroot().find('./channel/item')
+                  if item is None or item.findtext(ns + 'version') != tag[1:]:
+                      raise SystemExit('Bundle version differs from the release tag')
+                  enclosure = item.find('enclosure')
+                  if enclosure is None or not enclosure.get(ns + 'edSignature'):
+                      raise SystemExit('Update signature missing')
+                  gh('release', 'upload', tag, str(feed), '--repo', repo, '--clobber')
