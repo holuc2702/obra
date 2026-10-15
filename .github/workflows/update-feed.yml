@@ -30,7 +30,7 @@ jobs:
           mkdir "$RUNNER_TEMP/sparkle"
           tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
       - name: Sign installer archives and attach update feeds
-        shell: python
+        shell: python3 {0}
         run: |
           import html, json, os, pathlib, re, subprocess, tempfile, xml.etree.ElementTree as ET
           repo, tag = os.environ['RELEASE_REPO'], os.environ['RELEASE_TAG']
@@ -58,6 +58,10 @@ jobs:
                       assets[arch] = asset
           if not assets:
               raise SystemExit('No correctly named obra DMG/ZIP installer attached')
+          if 'universal' in assets:
+              # Preserve the feed addresses embedded in earlier architecture-specific apps.
+              for arch in ('aarch64', 'x86_64'):
+                  assets.setdefault(arch, assets['universal'])
           ns = '{http://www.andymatuschak.org/xml-namespaces/sparkle}'
           with tempfile.TemporaryDirectory(prefix='obra-feeds-') as folder:
               root = pathlib.Path(folder)
